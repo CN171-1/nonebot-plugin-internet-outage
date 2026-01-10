@@ -19,7 +19,7 @@ class InternetOutageConfig(BaseModel):
 
 __plugin_meta__ = PluginMetadata(
     name="互联网异常事件监测",
-    description="基于 Cloudflare Radar 的全球断网事件自动推送",
+    description="基于 Cloudflare Radar 的全球互联网异常事件自动推送",
     usage="自动运行",
     type="application",
     homepage="https://github.com/CN171-1/nonebot-plugin-internet-outage",
