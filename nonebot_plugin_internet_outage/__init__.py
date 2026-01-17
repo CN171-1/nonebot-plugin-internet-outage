@@ -5,7 +5,7 @@ from nonebot.adapters.onebot.v11 import Message
 
 import httpx
 import json
-import datetime
+from datetime import datetime
 from pathlib import Path
 
 # -----------------------------
@@ -109,13 +109,24 @@ async def fetch_outages():
     data = await get_json(OUTAGE_API, params)
     return data.get("result", {}).get("annotations", [])
 
+def normalize_time(ts: str, bucket_minutes: int = 30) -> str:
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    bucket = (dt.minute // bucket_minutes) * bucket_minutes
+    normalized = dt.replace(minute=bucket, second=0, microsecond=0)
+    return normalized.isoformat()
+
+def build_event_id(country: str, start_date: str) -> str:
+    normalized_time = normalize_time(start_date, 30)
+    event_id = f"{country}_{normalized_time}"
+    return event_id
+
 def match_outage(anomaly, outages):
     country = anomaly["locationDetails"]["code"]
-    a_start = datetime.datetime.fromisoformat(anomaly["startDate"].replace("Z", "+00:00"))
+    a_start = datetime.fromisoformat(anomaly["startDate"].replace("Z", "+00:00"))
     for o in outages:
         if country not in o["locations"]:
             continue
-        o_start = datetime.datetime.fromisoformat(o["startDate"].replace("Z", "+00:00"))
+        o_start = datetime.fromisoformat(o["startDate"].replace("Z", "+00:00"))
         if abs((a_start - o_start).total_seconds()) <= 900:
             return o
     return None
@@ -160,78 +171,118 @@ async def broadcast(message: Message):
         except Exception as e:
             logger.error(f"推送至群 {gid} 失败: {e}")
 
-
-@scheduler.scheduled_job(
-    "interval",
-    minutes=10,
-    id="internet_outage_monitor",
-    misfire_grace_time=20
-)
+@scheduler.scheduled_job("interval", minutes=10, id="internet_outage_monitor", misfire_grace_time=20)
 async def outage_schedule():
     key = "outage_events"
+
     anomalies = await fetch_traffic_anomalies()
     outages = await fetch_outages()
+
+    if anomalies is None or outages is None:
+        logger.warning(
+            "Cloudflare Radar 数据不完整（anomalies 或 outages 获取失败），跳过本轮检查"
+        )
+        return
+
     seen = await storage.get_seen_dict(key)
     first_run = await storage.is_first_run(key)
 
-    # 先处理 anomalies -> outage 匹配
+    used_outages: set[tuple] = set()
+
     for a in anomalies:
-        uuid = a["uuid"]
+        country = a["locationDetails"]["code"]
+        event_id = build_event_id(country, a["startDate"])
+
         outage = match_outage(a, outages)
 
-        if uuid not in seen:
+        # 如果匹配到了 outage，先标记该 outage 已被使用
+        if outage:
+            outage_id = (
+                outage["outage"]["outageType"],
+                outage["outage"]["outageCause"],
+                outage["startDate"],
+                tuple(outage["locations"]),
+            )
+            used_outages.add(outage_id)
+
+        if event_id not in seen:
             # 新事件
             if outage:
                 msg = build_message(outage)
-                sent_type = "anomaly + outage"
-                if not first_run:
-                    await broadcast(msg)
-                logger.info(
-                    f"发现断网事件（anomaly + outage）：[{a['locationDetails']['code']}] "
-                    f"{outage['outage']['outageCause']}"
-                )
+                sent_type = "outage"
+                log_type = "anomaly + outage"
             else:
                 msg = build_message_from_anomaly(a)
                 sent_type = "anomaly"
-                if not first_run:
-                    await broadcast(msg)
-                logger.info(
-                    f"发现断网事件（仅 anomaly）：[{a['locationDetails']['code']}] UNKNOWN"
+                log_type = "anomaly"
+
+            if not first_run:
+                await broadcast(msg)
+
+            if outage:
+                cause = OUTAGE_CAUSE_MAP.get(
+                    outage["outage"]["outageCause"],
+                    outage["outage"]["outageCause"]
                 )
-            seen[uuid] = {"sent_type": sent_type}
+                logger.info(
+                    f"发现断网事件（{log_type}）：[{country}] {cause}"
+                )
+            else:
+                logger.info(
+                    f"发现断网事件（{log_type}）：[{country}]"
+                )
+
+            seen[event_id] = {"sent_type": sent_type}
 
         else:
-            # 已存在
-            prev_type = seen[uuid]["sent_type"]
-            if prev_type == "anomaly" and outage:
-                # 升级为 outage
+            # anomaly -> outage 升级
+            if seen[event_id]["sent_type"] == "anomaly" and outage:
                 msg = build_message(outage)
-                await broadcast(msg)
-                logger.info(
-                    f"更新断网事件（anomaly -> outage）：[{a['locationDetails']['code']}] "
-                    f"{outage['outage']['outageCause']}"
-                )
-                seen[uuid]["sent_type"] = "anomaly -> outage"
 
-    # 再处理仅 outages，没有对应 anomaly 的情况
-    for o in outages:
-        # 找出 location 对应的 anomaly
-        found = False
-        for a in anomalies:
-            if match_outage(a, [o]):
-                found = True
-                break
-        if not found:
-            # 仅 outage
-            loc_codes = o["locations"]
-            uuid = f"outage_{loc_codes[0]}_{o['startDate']}"  # 生成唯一标识
-            if uuid not in seen:
-                msg = build_message(o)
                 if not first_run:
                     await broadcast(msg)
-                logger.info(
-                    f"发现断网事件（仅 outage）：{loc_codes} {o['outage']['outageCause']}"
+
+                cause = OUTAGE_CAUSE_MAP.get(
+                    outage["outage"]["outageCause"],
+                    outage["outage"]["outageCause"]
                 )
-                seen[uuid] = {"sent_type": "outage"}
+                logger.info(
+                    f"更新断网事件（anomaly -> outage）：[{country}] {cause}"
+                )
+
+                seen[event_id]["sent_type"] = "outage"
+
+    for o in outages:
+        outage_id = (
+            o["outage"]["outageType"],
+            o["outage"]["outageCause"],
+            o["startDate"],
+            tuple(o["locations"]),
+        )
+
+        # 已被 anomaly 消费过的 outage，直接跳过
+        if outage_id in used_outages:
+            continue
+
+        country = o["locations"][0]
+        event_id = build_event_id(country, o["startDate"])
+
+        if event_id in seen:
+            continue
+
+        msg = build_message(o)
+
+        if not first_run:
+            await broadcast(msg)
+
+        cause = OUTAGE_CAUSE_MAP.get(
+            o["outage"]["outageCause"],
+            o["outage"]["outageCause"]
+        )
+        logger.info(
+            f"发现断网事件（仅 outage）：[{country}] {cause}"
+        )
+
+        seen[event_id] = {"sent_type": "outage"}
 
     await storage.save_seen_dict(key, seen)
